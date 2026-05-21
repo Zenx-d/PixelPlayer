@@ -115,7 +115,7 @@ class MusicRepositoryImplTest {
             artistImageRepository = mockArtistImageRepository,
             folderTreeBuilder = mockk(relaxed = true),
             appScope = kotlinx.coroutines.CoroutineScope(
-                kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Unconfined
+                kotlinx.coroutines.SupervisorJob() + testDispatcher
             ),
         )
     }

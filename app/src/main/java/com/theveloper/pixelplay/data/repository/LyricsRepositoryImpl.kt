@@ -1610,6 +1610,7 @@ class LyricsRepositoryImpl @Inject constructor(
                 // downstream TagLib reader only needs file headers (~10 MB
                 // covers every realistic embedded-tag layout); abort cleanly
                 // if more is required than the cap allows.
+                var exceededCopyLimit = false
                 FileOutputStream(tempFile).use { output ->
                     val buffer = ByteArray(64 * 1024)
                     var totalCopied = 0L
@@ -1617,12 +1618,19 @@ class LyricsRepositoryImpl @Inject constructor(
                         val read = inputStream.read(buffer)
                         if (read <= 0) break
                         if (totalCopied + read > TEMP_AUDIO_COPY_MAX_BYTES) {
-                            output.write(buffer, 0, (TEMP_AUDIO_COPY_MAX_BYTES - totalCopied).toInt())
+                            exceededCopyLimit = true
                             break
                         }
                         output.write(buffer, 0, read)
                         totalCopied += read
                     }
+                }
+                if (exceededCopyLimit) {
+                    if (!tempFile.delete()) {
+                        tempFile.deleteOnExit()
+                    }
+                    LogUtils.w(this@LyricsRepositoryImpl, "Refusing oversized audio URI copy (> $TEMP_AUDIO_COPY_MAX_BYTES bytes): $uri")
+                    return null
                 }
                 tempFile
             }

@@ -50,15 +50,13 @@ class LyricsStateHolderTest {
         val musicRepository = mockk<MusicRepository>(relaxed = true)
         val userPreferencesRepository = mockk<UserPreferencesRepository>(relaxed = true)
         val songMetadataEditor = mockk<SongMetadataEditor>(relaxed = true)
+        val scope = TestScope(StandardTestDispatcher())
         val holder = LyricsStateHolder(
             musicRepository = musicRepository,
             userPreferencesRepository = userPreferencesRepository,
             songMetadataEditor = songMetadataEditor,
-            appScope = kotlinx.coroutines.CoroutineScope(
-                kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Unconfined
-            ),
+            appScope = scope,
         )
-        val scope = TestScope(StandardTestDispatcher())
         val callback = RecordingLyricsLoadCallback()
         val state = MutableStateFlow(StablePlayerState())
         val song = testSong(albumArtUriString = "content://art/song_art_1.jpg").copy(
