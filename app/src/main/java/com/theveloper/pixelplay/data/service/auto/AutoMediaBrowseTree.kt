@@ -14,6 +14,9 @@ import com.theveloper.pixelplay.data.preferences.PlaylistPreferencesRepository
 import com.theveloper.pixelplay.data.repository.MusicRepository
 import com.theveloper.pixelplay.utils.MediaItemBuilder
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.first
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -118,22 +121,41 @@ class AutoMediaBrowseTree @Inject constructor(
     suspend fun search(query: String): List<MediaItem> {
         if (query.isBlank()) return emptyList()
 
-        val results = mutableListOf<MediaItem>()
         val trimmedQuery = query.trim()
 
-        // Search songs
-        val songs = musicRepository.searchSongs(trimmedQuery).first()
-        results.addAll(songs.take(MAX_SEARCH_RESULTS).map { buildPlayableSongItem(it) })
+        // Run the three searches concurrently and round-robin-merge the
+        // results so an album/artist hit isn't squeezed out by 30+ song
+        // matches. Previous behaviour always biased to songs.
+        val (songs, albums, artists) = coroutineScope {
+            val songsDeferred = async {
+                musicRepository.searchSongs(trimmedQuery).first()
+                    .map { buildPlayableSongItem(it) }
+            }
+            val albumsDeferred = async {
+                musicRepository.searchAlbums(trimmedQuery).first()
+                    .map { buildBrowsableAlbumItem(it) }
+            }
+            val artistsDeferred = async {
+                musicRepository.searchArtists(trimmedQuery).first()
+                    .map { buildBrowsableArtistItem(it) }
+            }
+            val results = awaitAll(songsDeferred, albumsDeferred, artistsDeferred)
+            Triple(results[0], results[1], results[2])
+        }
 
-        // Search albums
-        val albums = musicRepository.searchAlbums(trimmedQuery).first()
-        results.addAll(albums.take(10).map { buildBrowsableAlbumItem(it) })
-
-        // Search artists
-        val artists = musicRepository.searchArtists(trimmedQuery).first()
-        results.addAll(artists.take(10).map { buildBrowsableArtistItem(it) })
-
-        return results.take(MAX_SEARCH_RESULTS)
+        val results = mutableListOf<MediaItem>()
+        val songIter = songs.iterator()
+        val albumIter = albums.iterator()
+        val artistIter = artists.iterator()
+        // Each round adds at most one of each category until we hit the cap.
+        while (results.size < MAX_SEARCH_RESULTS &&
+            (songIter.hasNext() || albumIter.hasNext() || artistIter.hasNext())
+        ) {
+            if (songIter.hasNext() && results.size < MAX_SEARCH_RESULTS) results.add(songIter.next())
+            if (albumIter.hasNext() && results.size < MAX_SEARCH_RESULTS) results.add(albumIter.next())
+            if (artistIter.hasNext() && results.size < MAX_SEARCH_RESULTS) results.add(artistIter.next())
+        }
+        return results
     }
 
     // --- Private helpers ---

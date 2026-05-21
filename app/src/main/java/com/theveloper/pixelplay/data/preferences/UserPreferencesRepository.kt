@@ -24,15 +24,30 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.text.get
 import kotlin.text.set
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import timber.log.Timber
 
 val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+
+// Per CODEBASE_REVIEW.md, splitting the single 117-key "settings" DataStore
+// into per-domain stores reduces cross-domain re-emission on every write.
+// This dedicated playback store is the staging point for migrating
+// playback-related preferences (shuffle persistence, queue snapshot,
+// crossfade duration, transition settings) out of "settings" without
+// breaking existing readers. Migration is incremental: until a key is
+// migrated, both stores can be safely read from.
+val Context.playbackDataStore: DataStore<Preferences> by preferencesDataStore(name = "playback")
 
 object ThemePreference {
     const val DEFAULT = "default"
@@ -73,8 +88,116 @@ class UserPreferencesRepository
 @Inject
 constructor(
         private val dataStore: DataStore<Preferences>,
-        private val json: Json // Inyectar Json para serialización
+        @com.theveloper.pixelplay.di.PlaybackDataStore private val playbackStore: DataStore<Preferences>,
+        private val json: Json, // Inyectar Json para serialización
+        @com.theveloper.pixelplay.di.AppScope private val migrationScope: kotlinx.coroutines.CoroutineScope,
 ) {
+
+    init {
+        // One-time migration of playback-domain keys from the main "settings"
+        // store into the dedicated "playback" store. Idempotent: once the
+        // marker key lands in playbackStore the migration is a no-op.
+        migrationScope.launch {
+            runCatching { migratePlaybackKeysIfNeeded() }
+                .onFailure { Timber.e(it, "Playback keys migration failed; will retry next launch") }
+        }
+    }
+
+    private suspend fun migratePlaybackKeysIfNeeded() {
+        val playbackSnapshot = playbackStore.data.first()
+        if (playbackSnapshot[PlaybackPreferencesKeys.MIGRATION_DONE] == true) return
+
+        val legacySnapshot = dataStore.data.first()
+        playbackStore.edit { prefs ->
+            legacySnapshot[PreferencesKeys.PERSISTENT_SHUFFLE_ENABLED]?.let {
+                prefs[PlaybackPreferencesKeys.PERSISTENT_SHUFFLE_ENABLED] = it
+            }
+            legacySnapshot[PreferencesKeys.IS_SHUFFLE_ON]?.let {
+                prefs[PlaybackPreferencesKeys.IS_SHUFFLE_ON] = it
+            }
+            legacySnapshot[PreferencesKeys.IS_CROSSFADE_ENABLED]?.let {
+                prefs[PlaybackPreferencesKeys.IS_CROSSFADE_ENABLED] = it
+            }
+            legacySnapshot[PreferencesKeys.CROSSFADE_DURATION]?.let {
+                prefs[PlaybackPreferencesKeys.CROSSFADE_DURATION] = it
+            }
+            legacySnapshot[PreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT]?.let {
+                prefs[PlaybackPreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT] = it
+            }
+            legacySnapshot[PreferencesKeys.GLOBAL_TRANSITION_SETTINGS]?.let {
+                prefs[PlaybackPreferencesKeys.GLOBAL_TRANSITION_SETTINGS] = it
+            }
+            legacySnapshot[PreferencesKeys.REPEAT_MODE]?.let {
+                prefs[PlaybackPreferencesKeys.REPEAT_MODE] = it
+            }
+            legacySnapshot[PreferencesKeys.HI_FI_MODE_ENABLED]?.let {
+                prefs[PlaybackPreferencesKeys.HI_FI_MODE_ENABLED] = it
+            }
+            legacySnapshot[PreferencesKeys.KEEP_PLAYING_IN_BACKGROUND]?.let {
+                prefs[PlaybackPreferencesKeys.KEEP_PLAYING_IN_BACKGROUND] = it
+            }
+            legacySnapshot[PreferencesKeys.REPLAYGAIN_ENABLED]?.let {
+                prefs[PlaybackPreferencesKeys.REPLAYGAIN_ENABLED] = it
+            }
+            legacySnapshot[PreferencesKeys.REPLAYGAIN_USE_ALBUM_GAIN]?.let {
+                prefs[PlaybackPreferencesKeys.REPLAYGAIN_USE_ALBUM_GAIN] = it
+            }
+            legacySnapshot[PreferencesKeys.DISABLE_CAST_AUTOPLAY]?.let {
+                prefs[PlaybackPreferencesKeys.DISABLE_CAST_AUTOPLAY] = it
+            }
+            prefs[PlaybackPreferencesKeys.MIGRATION_DONE] = true
+        }
+        // Don't remove from the legacy store yet — readers that haven't
+        // migrated to the new flow would break. Removal happens once every
+        // reader is pointed at the new store (separate PR).
+    }
+
+    /**
+     * Reads a key that has been migrated from the legacy "settings" store to
+     * the dedicated playback store. Prefer the new store's value when
+     * present; fall back to the legacy store only during the narrow window
+     * between app launch and [migratePlaybackKeysIfNeeded] completing on
+     * existing installs. Once the migration marker is set, the legacy store
+     * is no longer consulted (so a stray legacy write can't override the
+     * migrated value).
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun <T> playbackKeyFlow(
+        playbackKey: Preferences.Key<T>,
+        legacyKey: Preferences.Key<T>,
+    ): Flow<T?> = playbackStore.data.flatMapLatest { newPrefs ->
+        val newValue = newPrefs[playbackKey]
+        val migrationDone = newPrefs[PlaybackPreferencesKeys.MIGRATION_DONE] == true
+        when {
+            newValue != null -> flowOf(newValue)
+            migrationDone -> flowOf(null)
+            else -> dataStore.data.map { legacy -> legacy[legacyKey] }
+        }
+    }
+
+    private object PlaybackPreferencesKeys {
+        val MIGRATION_DONE = booleanPreferencesKey("playback_migration_done")
+        val PERSISTENT_SHUFFLE_ENABLED = booleanPreferencesKey("persistent_shuffle_enabled")
+        val IS_SHUFFLE_ON = booleanPreferencesKey("is_shuffle_on")
+        val IS_CROSSFADE_ENABLED = booleanPreferencesKey("is_crossfade_enabled")
+        val CROSSFADE_DURATION = androidx.datastore.preferences.core.intPreferencesKey("crossfade_duration")
+        val PLAYBACK_QUEUE_SNAPSHOT =
+            androidx.datastore.preferences.core.stringPreferencesKey("playback_queue_snapshot_v1")
+        val GLOBAL_TRANSITION_SETTINGS =
+            androidx.datastore.preferences.core.stringPreferencesKey("global_transition_settings_json")
+        val REPEAT_MODE =
+            androidx.datastore.preferences.core.intPreferencesKey("repeat_mode")
+        val HI_FI_MODE_ENABLED =
+            booleanPreferencesKey("hi_fi_mode_enabled")
+        val KEEP_PLAYING_IN_BACKGROUND =
+            booleanPreferencesKey("keep_playing_in_background")
+        val REPLAYGAIN_ENABLED =
+            booleanPreferencesKey("replaygain_enabled")
+        val REPLAYGAIN_USE_ALBUM_GAIN =
+            booleanPreferencesKey("replaygain_use_album_gain")
+        val DISABLE_CAST_AUTOPLAY =
+            booleanPreferencesKey("disable_cast_autoplay")
+    }
 
     private val backupExcludedKeyNames = setOf(
         PreferencesKeys.INITIAL_SETUP_DONE.name
@@ -264,22 +387,30 @@ constructor(
     }
 
     val isCrossfadeEnabledFlow: Flow<Boolean> =
-            dataStore.data.map { preferences ->
-                preferences[PreferencesKeys.IS_CROSSFADE_ENABLED] ?: false
-            }
+            playbackKeyFlow(
+                PlaybackPreferencesKeys.IS_CROSSFADE_ENABLED,
+                PreferencesKeys.IS_CROSSFADE_ENABLED,
+            ).map { it ?: false }
 
     suspend fun setCrossfadeEnabled(enabled: Boolean) {
+        playbackStore.edit { prefs ->
+            prefs[PlaybackPreferencesKeys.IS_CROSSFADE_ENABLED] = enabled
+        }
         dataStore.edit { preferences ->
             preferences[PreferencesKeys.IS_CROSSFADE_ENABLED] = enabled
         }
     }
 
     val hiFiModeEnabledFlow: Flow<Boolean> =
-        dataStore.data.map { preferences ->
-            preferences[PreferencesKeys.HI_FI_MODE_ENABLED] ?: false
-        }
+        playbackKeyFlow(
+            PlaybackPreferencesKeys.HI_FI_MODE_ENABLED,
+            PreferencesKeys.HI_FI_MODE_ENABLED,
+        ).map { it ?: false }
 
     suspend fun setHiFiModeEnabled(enabled: Boolean) {
+        playbackStore.edit { prefs ->
+            prefs[PlaybackPreferencesKeys.HI_FI_MODE_ENABLED] = enabled
+        }
         dataStore.edit { preferences ->
             preferences[PreferencesKeys.HI_FI_MODE_ENABLED] = enabled
         }
@@ -298,13 +429,16 @@ constructor(
     }
 
     val crossfadeDurationFlow: Flow<Int> =
-            dataStore.data.map { preferences ->
-                (preferences[PreferencesKeys.CROSSFADE_DURATION] ?: 2000).coerceIn(1000, 12000)
-            }
+            playbackKeyFlow(
+                PlaybackPreferencesKeys.CROSSFADE_DURATION,
+                PreferencesKeys.CROSSFADE_DURATION,
+            ).map { (it ?: 2000).coerceIn(1000, 12000) }
 
     suspend fun setCrossfadeDuration(duration: Int) {
+        val clamped = duration.coerceIn(1000, 12000)
+        playbackStore.edit { prefs -> prefs[PlaybackPreferencesKeys.CROSSFADE_DURATION] = clamped }
         dataStore.edit { preferences ->
-            preferences[PreferencesKeys.CROSSFADE_DURATION] = duration.coerceIn(1000, 12000)
+            preferences[PreferencesKeys.CROSSFADE_DURATION] = clamped
         }
     }
 
@@ -353,37 +487,55 @@ constructor(
         }
     }
     val repeatModeFlow: Flow<Int> =
-            dataStore.data.map { preferences ->
-                preferences[PreferencesKeys.REPEAT_MODE] ?: Player.REPEAT_MODE_OFF
-            }
+            playbackKeyFlow(
+                PlaybackPreferencesKeys.REPEAT_MODE,
+                PreferencesKeys.REPEAT_MODE,
+            ).map { it ?: Player.REPEAT_MODE_OFF }
 
     suspend fun setRepeatMode(@Player.RepeatMode mode: Int) {
+        playbackStore.edit { prefs -> prefs[PlaybackPreferencesKeys.REPEAT_MODE] = mode }
         dataStore.edit { preferences -> preferences[PreferencesKeys.REPEAT_MODE] = mode }
     }
 
     val isShuffleOnFlow: Flow<Boolean> =
-            dataStore.data.map { preferences ->
-                preferences[PreferencesKeys.IS_SHUFFLE_ON] ?: false
-            }
+            playbackKeyFlow(
+                PlaybackPreferencesKeys.IS_SHUFFLE_ON,
+                PreferencesKeys.IS_SHUFFLE_ON,
+            ).map { it ?: false }
 
     suspend fun setShuffleOn(on: Boolean) {
+        // Dual-write during the migration window.
+        playbackStore.edit { prefs -> prefs[PlaybackPreferencesKeys.IS_SHUFFLE_ON] = on }
         dataStore.edit { preferences -> preferences[PreferencesKeys.IS_SHUFFLE_ON] = on }
     }
 
+    // Reads from the dedicated playback store (post-migration). Falls back
+    // to the legacy "settings" store value if migration hasn't completed
+    // yet, so existing installs don't briefly see the default during the
+    // grace window.
     val persistentShuffleEnabledFlow: Flow<Boolean> =
-            dataStore.data.map { preferences ->
-                preferences[PreferencesKeys.PERSISTENT_SHUFFLE_ENABLED] ?: false
-            }
+            playbackKeyFlow(
+                PlaybackPreferencesKeys.PERSISTENT_SHUFFLE_ENABLED,
+                PreferencesKeys.PERSISTENT_SHUFFLE_ENABLED,
+            ).map { it ?: false }
 
     suspend fun setPersistentShuffleEnabled(enabled: Boolean) {
-        dataStore.edit { preferences -> preferences[PreferencesKeys.PERSISTENT_SHUFFLE_ENABLED] = enabled }
+        // Write through to both stores during the migration window so any
+        // consumer still reading from the legacy store stays in sync.
+        playbackStore.edit { prefs ->
+            prefs[PlaybackPreferencesKeys.PERSISTENT_SHUFFLE_ENABLED] = enabled
+        }
+        dataStore.edit { preferences ->
+            preferences[PreferencesKeys.PERSISTENT_SHUFFLE_ENABLED] = enabled
+        }
     }
 
     val playbackQueueSnapshotFlow: Flow<PlaybackQueueSnapshot?> =
-            dataStore.data.map { preferences ->
-                preferences[PreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT]?.let { raw ->
-                    runCatching { json.decodeFromString<PlaybackQueueSnapshot>(raw) }.getOrNull()
-                }
+            playbackKeyFlow(
+                PlaybackPreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT,
+                PreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT,
+            ).map { raw ->
+                raw?.let { runCatching { json.decodeFromString<PlaybackQueueSnapshot>(it) }.getOrNull() }
             }
 
     suspend fun getPlaybackQueueSnapshotOnce(): PlaybackQueueSnapshot? {
@@ -391,12 +543,15 @@ constructor(
     }
 
     suspend fun setPlaybackQueueSnapshot(snapshot: PlaybackQueueSnapshot?) {
+        val encoded = if (snapshot == null || snapshot.items.isEmpty()) null
+        else json.encodeToString(snapshot)
+        playbackStore.edit { prefs ->
+            if (encoded == null) prefs.remove(PlaybackPreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT)
+            else prefs[PlaybackPreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT] = encoded
+        }
         dataStore.edit { preferences ->
-            if (snapshot == null || snapshot.items.isEmpty()) {
-                preferences.remove(PreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT)
-            } else {
-                preferences[PreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT] = json.encodeToString(snapshot)
-            }
+            if (encoded == null) preferences.remove(PreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT)
+            else preferences[PreferencesKeys.PLAYBACK_QUEUE_SNAPSHOT] = encoded
         }
     }
 
@@ -636,25 +791,29 @@ constructor(
 
     // ===== End Multi-Artist Settings =====
 
-    val globalTransitionSettingsFlow: Flow<TransitionSettings> =
-            dataStore.data.map { preferences ->
-                val duration = (preferences[PreferencesKeys.CROSSFADE_DURATION] ?: 2000).coerceIn(1000, 12000)
-                val settings =
-                        preferences[PreferencesKeys.GLOBAL_TRANSITION_SETTINGS]?.let { jsonString ->
-                            try {
-                                json.decodeFromString<TransitionSettings>(jsonString)
-                            } catch (e: Exception) {
-                                TransitionSettings() // Return default on error
-                            }
-                        }
-                                ?: TransitionSettings() // Return default if not set
-
-                settings.copy(durationMs = duration)
-            }
+    val globalTransitionSettingsFlow: Flow<TransitionSettings> = combine(
+        playbackKeyFlow(
+            PlaybackPreferencesKeys.CROSSFADE_DURATION,
+            PreferencesKeys.CROSSFADE_DURATION,
+        ),
+        playbackKeyFlow(
+            PlaybackPreferencesKeys.GLOBAL_TRANSITION_SETTINGS,
+            PreferencesKeys.GLOBAL_TRANSITION_SETTINGS,
+        ),
+    ) { duration, jsonString ->
+        val safeDuration = (duration ?: 2000).coerceIn(1000, 12000)
+        val settings = jsonString?.let {
+            runCatching { json.decodeFromString<TransitionSettings>(it) }.getOrNull()
+        } ?: TransitionSettings()
+        settings.copy(durationMs = safeDuration)
+    }
 
     suspend fun saveGlobalTransitionSettings(settings: TransitionSettings) {
+        val jsonString = json.encodeToString(settings)
+        playbackStore.edit { prefs ->
+            prefs[PlaybackPreferencesKeys.GLOBAL_TRANSITION_SETTINGS] = jsonString
+        }
         dataStore.edit { preferences ->
-            val jsonString = json.encodeToString(settings)
             preferences[PreferencesKeys.GLOBAL_TRANSITION_SETTINGS] = jsonString
         }
     }
@@ -770,22 +929,30 @@ constructor(
     // ===== ReplayGain =====
 
     val replayGainEnabledFlow: Flow<Boolean> =
-        dataStore.data.map { preferences ->
-            preferences[PreferencesKeys.REPLAYGAIN_ENABLED] ?: false
-        }
+        playbackKeyFlow(
+            PlaybackPreferencesKeys.REPLAYGAIN_ENABLED,
+            PreferencesKeys.REPLAYGAIN_ENABLED,
+        ).map { it ?: false }
 
     val replayGainUseAlbumGainFlow: Flow<Boolean> =
-        dataStore.data.map { preferences ->
-            preferences[PreferencesKeys.REPLAYGAIN_USE_ALBUM_GAIN] ?: false
-        }
+        playbackKeyFlow(
+            PlaybackPreferencesKeys.REPLAYGAIN_USE_ALBUM_GAIN,
+            PreferencesKeys.REPLAYGAIN_USE_ALBUM_GAIN,
+        ).map { it ?: false }
 
     suspend fun setReplayGainEnabled(enabled: Boolean) {
+        playbackStore.edit { prefs ->
+            prefs[PlaybackPreferencesKeys.REPLAYGAIN_ENABLED] = enabled
+        }
         dataStore.edit { preferences ->
             preferences[PreferencesKeys.REPLAYGAIN_ENABLED] = enabled
         }
     }
 
     suspend fun setReplayGainUseAlbumGain(useAlbumGain: Boolean) {
+        playbackStore.edit { prefs ->
+            prefs[PlaybackPreferencesKeys.REPLAYGAIN_USE_ALBUM_GAIN] = useAlbumGain
+        }
         dataStore.edit { preferences ->
             preferences[PreferencesKeys.REPLAYGAIN_USE_ALBUM_GAIN] = useAlbumGain
         }
@@ -809,14 +976,16 @@ constructor(
             }
 
     val keepPlayingInBackgroundFlow: Flow<Boolean> =
-            dataStore.data.map { preferences ->
-                preferences[PreferencesKeys.KEEP_PLAYING_IN_BACKGROUND] ?: true
-            }
+            playbackKeyFlow(
+                PlaybackPreferencesKeys.KEEP_PLAYING_IN_BACKGROUND,
+                PreferencesKeys.KEEP_PLAYING_IN_BACKGROUND,
+            ).map { it ?: true }
 
     val disableCastAutoplayFlow: Flow<Boolean> =
-            dataStore.data.map { preferences ->
-                preferences[PreferencesKeys.DISABLE_CAST_AUTOPLAY] ?: false
-            }
+            playbackKeyFlow(
+                PlaybackPreferencesKeys.DISABLE_CAST_AUTOPLAY,
+                PreferencesKeys.DISABLE_CAST_AUTOPLAY,
+            ).map { it ?: false }
 
     val resumeOnHeadsetReconnectFlow: Flow<Boolean> =
             dataStore.data.map { preferences ->
@@ -1289,12 +1458,18 @@ constructor(
     }
 
     suspend fun setKeepPlayingInBackground(enabled: Boolean) {
+        playbackStore.edit { prefs ->
+            prefs[PlaybackPreferencesKeys.KEEP_PLAYING_IN_BACKGROUND] = enabled
+        }
         dataStore.edit { preferences ->
             preferences[PreferencesKeys.KEEP_PLAYING_IN_BACKGROUND] = enabled
         }
     }
 
     suspend fun setDisableCastAutoplay(disabled: Boolean) {
+        playbackStore.edit { prefs ->
+            prefs[PlaybackPreferencesKeys.DISABLE_CAST_AUTOPLAY] = disabled
+        }
         dataStore.edit { preferences ->
             preferences[PreferencesKeys.DISABLE_CAST_AUTOPLAY] = disabled
         }
