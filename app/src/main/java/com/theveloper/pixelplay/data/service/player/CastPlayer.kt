@@ -23,6 +23,7 @@ import com.google.android.gms.common.api.PendingResult
 import com.google.android.gms.common.images.WebImage
 import com.theveloper.pixelplay.data.model.Song
 import com.theveloper.pixelplay.data.service.cast.CastAudioMimeUtils
+import com.theveloper.pixelplay.data.service.cast.IsoBmffAudioCodecDetector
 import com.theveloper.pixelplay.data.service.http.CastSessionSecurity
 import org.json.JSONObject
 import timber.log.Timber
@@ -38,6 +39,7 @@ class CastPlayer(
 
     companion object {
         private const val MIME_NONE = ""
+        private const val ISO_BMFF_CODEC_PROBE_BYTES = 1024 * 1024
         private val extractorMimeCache = java.util.concurrent.ConcurrentHashMap<String, String>()
         private val retrieverMimeCache = java.util.concurrent.ConcurrentHashMap<String, String>()
         private val signatureMimeCache = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -481,9 +483,7 @@ class CastPlayer(
     ): MediaQueueItem {
         val contentType = forcedMimeType ?: resolveCastContentType()
         val durationHintMs = this.duration.coerceAtLeast(0L)
-        // Some library entries report inaccurate duration metadata. Let Cast infer duration
-        // from the stream to avoid false "track ended" auto-skips on problematic files.
-        val streamDuration = MediaInfo.UNKNOWN_DURATION
+        val streamDuration = durationHintMs.takeIf { it > 0L } ?: MediaInfo.UNKNOWN_DURATION
         val streamRevision = buildCastStreamRevision(contentType, queueLoadNonce)
 
         val mediaMetadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MUSIC_TRACK)
@@ -914,11 +914,18 @@ class CastPlayer(
                         if (trackMime == "audio/mp4a-latm" || trackMime == "audio/eac3" || trackMime == "audio/ac3") {
                             val isM4a = song.path.endsWith(".m4a", true)
                             val isExplicitAlacMetadata = song.mimeType?.contains("alac", true) == true
-                            val hasHighBitrate = (runCatching { trackFormat.getInteger(MediaFormat.KEY_BIT_RATE) }.getOrNull() ?: 0) > 600_000
-                            
-                            val isImpossibleCodecInM4a = isM4a && (trackMime == "audio/eac3" || trackMime == "audio/ac3")
-                            
-                            if (isExplicitAlacMetadata || isImpossibleCodecInM4a || (isM4a && hasHighBitrate)) {
+                            val isoBmffCodec = if (isM4a) detectIsoBmffAudioCodec(song) else null
+                            val hasCsd0 = (trackMime == "audio/eac3" || trackMime == "audio/ac3") &&
+                                runCatching { (trackFormat.getByteBuffer("csd-0")?.remaining() ?: 0) > 0 }
+                                    .getOrDefault(false)
+
+                            val isImpossibleCodecInM4a = isM4a &&
+                                (trackMime == "audio/eac3" || trackMime == "audio/ac3") &&
+                                hasCsd0 &&
+                                isoBmffCodec != "audio/ac3" &&
+                                isoBmffCodec != "audio/eac3"
+
+                            if (isExplicitAlacMetadata || isoBmffCodec == "audio/alac" || isImpossibleCodecInM4a) {
                                 trackMime = "audio/alac"
                             } else if (isM4a) {
                                 val mmr = MediaMetadataRetriever()
@@ -952,6 +959,13 @@ class CastPlayer(
         
         extractorMimeCache[song.id] = result ?: MIME_NONE
         return result
+    }
+
+    private fun detectIsoBmffAudioCodec(song: Song): String? {
+        return readAudioSignature(
+            song = song,
+            maxBytes = ISO_BMFF_CODEC_PROBE_BYTES
+        )?.let(IsoBmffAudioCodecDetector::detectAudioCodec)
     }
 
     private fun isMimeTypeDecoderSupported(mimeType: String): Boolean {
@@ -1075,6 +1089,9 @@ class CastPlayer(
                     "audio/webm",
                     "audio/amr"
                 )
+                val streamDurationSent = song.duration.coerceAtLeast(0L)
+                    .takeIf { it > 0L }
+                    ?: MediaInfo.UNKNOWN_DURATION
                 val mediaUrl = CastSessionSecurity.redactAuthToken(
                     CastSessionSecurity.buildSongUrl(
                         serverAddress = serverAddress,
@@ -1100,13 +1117,13 @@ class CastPlayer(
                     forcedMimeBySongId.containsKey(song.id),
                     likelySupported,
                     song.duration,
-                    MediaInfo.UNKNOWN_DURATION,
+                    streamDurationSent,
                     mediaUrl,
                     artUrl
                 )
                 Log.i(
                     "PX_CAST_QLOAD",
-                    "item index=$index songId=${song.id} mimeRaw=${song.mimeType} mimeSent=$sentMime mimeForced=${forcedMimeBySongId.containsKey(song.id)} durationHintMs=${song.duration.coerceAtLeast(0L)} streamDurationSentMs=${MediaInfo.UNKNOWN_DURATION}"
+                    "item index=$index songId=${song.id} mimeRaw=${song.mimeType} mimeSent=$sentMime mimeForced=${forcedMimeBySongId.containsKey(song.id)} durationHintMs=${song.duration.coerceAtLeast(0L)} streamDurationSentMs=$streamDurationSent"
                 )
             }
     }
